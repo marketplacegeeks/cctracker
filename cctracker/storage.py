@@ -70,6 +70,45 @@ def upsert_session(data: dict) -> None:
         )
 
 
+def insert_stub_session(data: dict) -> None:
+    """Insert a minimal stub at SessionStart. INSERT OR IGNORE so a subsequent
+    Stop-hook upsert always wins — the stub is only kept if Claude is killed
+    before the Stop hook fires."""
+    init_db()
+    with _connect() as conn:
+        conn.execute(
+            """
+            INSERT OR IGNORE INTO sessions (
+                session_uuid, date, start_time, end_time, duration_minutes,
+                input_tokens, output_tokens, total_tokens,
+                project, model, account, cwd, transcript_path
+            ) VALUES (
+                :session_uuid, :date, :start_time, :end_time, :duration_minutes,
+                :input_tokens, :output_tokens, :total_tokens,
+                :project, :model, :account, :cwd, :transcript_path
+            )
+            """,
+            data,
+        )
+
+
+def get_pending_sessions() -> list[sqlite3.Row]:
+    """Return all stub sessions not yet completed by the Stop hook."""
+    init_db()
+    with _connect() as conn:
+        return conn.execute(
+            "SELECT * FROM sessions WHERE model = 'pending'"
+        ).fetchall()
+
+
+def purge_ghost_sessions() -> int:
+    """Delete all sessions with zero total tokens. Returns the count removed."""
+    init_db()
+    with _connect() as conn:
+        cur = conn.execute("DELETE FROM sessions WHERE total_tokens = 0")
+        return cur.rowcount
+
+
 def update_achievement(session_id: int, text: str) -> bool:
     init_db()
     with _connect() as conn:

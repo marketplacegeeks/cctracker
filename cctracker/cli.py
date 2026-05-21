@@ -6,12 +6,15 @@ from pathlib import Path
 
 import click
 
-from .parser import parse_transcript
+from .parser import parse_start_stub, parse_transcript
 from .report import console, render_table
 from .storage import (
     get_last_session,
+    get_pending_sessions,
     get_session_by_id,
     get_sessions,
+    insert_stub_session,
+    purge_ghost_sessions,
     update_achievement,
     upsert_session,
 )
@@ -91,9 +94,35 @@ def hook_stop():
 
     try:
         session_data = parse_transcript(transcript_path)
-        upsert_session(session_data)
+        if session_data is not None:
+            upsert_session(session_data)
     except Exception:
         pass  # Never block Claude regardless of errors
+
+    sys.exit(0)
+
+
+# ── hook-start ───────────────────────────────────────────────────────────────
+
+@main.command("hook-start")
+def hook_start():
+    """
+    Called automatically by Claude Code's SessionStart hook.
+    Writes a pending stub so crash-killed sessions aren't lost.
+    Always exits 0 — never blocks Claude.
+    """
+    try:
+        raw = sys.stdin.read()
+        data = json.loads(raw) if raw.strip() else {}
+    except (json.JSONDecodeError, OSError):
+        sys.exit(0)
+
+    try:
+        stub = parse_start_stub(data)
+        if stub is not None:
+            insert_stub_session(stub)
+    except Exception:
+        pass
 
     sys.exit(0)
 
@@ -190,12 +219,48 @@ def export(output_path, days, account):
     console.print(f"[green]Exported {len(sessions)} session(s) → {dest}[/green]")
 
 
+# ── clean ────────────────────────────────────────────────────────────────────
+
+@main.command("clean")
+def clean():
+    """
+    Remove ghost sessions (zero tokens) from the database.
+
+    Before purging, attempts to recover any 'pending' stubs whose transcript
+    now has real conversation data (e.g. the session was killed mid-work but
+    the JSONL was written). This ensures a crash-killed session is promoted to
+    a full record rather than deleted.
+    """
+    # Pass 1: recover pending stubs that have real data in their transcript
+    recovered = 0
+    for sess in get_pending_sessions():
+        tp = sess["transcript_path"]
+        if tp and Path(tp).exists():
+            try:
+                full_data = parse_transcript(tp)
+                if full_data is not None:
+                    upsert_session(full_data)
+                    recovered += 1
+            except Exception:
+                pass
+
+    if recovered:
+        console.print(f"[cyan]Recovered {recovered} session(s) from transcript.[/cyan]")
+
+    # Pass 2: purge everything still at zero tokens (true ghosts / empty stubs)
+    removed = purge_ghost_sessions()
+    if removed:
+        console.print(f"[green]Removed {removed} ghost session(s).[/green]")
+    else:
+        console.print("[dim]No ghost sessions to remove.[/dim]")
+
+
 # ── setup ────────────────────────────────────────────────────────────────────
 
 @main.command("setup")
 def setup():
     """
-    Install cctracker's Stop hook into all Claude Code settings files.
+    Install cctracker's SessionStart and Stop hooks into all Claude Code settings files.
 
     Auto-discovers every ~/.claude* directory that has a settings.json.
     Safe to run multiple times — never duplicates or overwrites existing hooks.
@@ -216,53 +281,67 @@ def setup():
         )
         return
 
-    hook_entry = {
-        "hooks": [
-            {
-                "type": "command",
-                "command": f"{cctracker_bin} hook-stop",
-                "timeout": 10,
-            }
-        ]
-    }
+    def _make_hook_entry(subcommand: str) -> dict:
+        return {
+            "hooks": [
+                {
+                    "type": "command",
+                    "command": f"{cctracker_bin} {subcommand}",
+                    "timeout": 10,
+                }
+            ]
+        }
+
+    def _already_installed(hook_list: list) -> bool:
+        return any(
+            "cctracker" in h.get("hooks", [{}])[0].get("command", "")
+            for h in hook_list
+            if isinstance(h.get("hooks"), list) and h["hooks"]
+        )
 
     installed_any = False
     for config_dir in claude_dirs:
         settings_path = config_dir / "settings.json"
+        account_label = config_dir.name[len(".claude"):].lstrip("-") or "default"
 
         with open(settings_path, encoding="utf-8") as f:
             settings = json.load(f)
 
         hooks_section = settings.setdefault("hooks", {})
+        changed = False
+
+        # SessionStart hook — writes a stub so crash-killed sessions aren't lost
+        start_hooks: list = hooks_section.setdefault("SessionStart", [])
+        if _already_installed(start_hooks):
+            console.print(f"[dim]SessionStart already installed:[/dim] {settings_path}")
+        else:
+            start_hooks.append(_make_hook_entry("hook-start"))
+            changed = True
+
+        # Stop hook — upserts full session data when Claude exits cleanly
         stop_hooks: list = hooks_section.setdefault("Stop", [])
+        if _already_installed(stop_hooks):
+            console.print(f"[dim]Stop already installed:[/dim] {settings_path}")
+        else:
+            stop_hooks.append(_make_hook_entry("hook-stop"))
+            changed = True
 
-        # Idempotency: skip if our hook is already there
-        already = any(
-            "cctracker" in h.get("hooks", [{}])[0].get("command", "")
-            for h in stop_hooks
-            if isinstance(h.get("hooks"), list) and h["hooks"]
-        )
-        if already:
-            console.print(f"[dim]Already installed:[/dim] {settings_path}")
-            continue
-
-        stop_hooks.append(hook_entry)
-
-        with open(settings_path, "w", encoding="utf-8") as f:
-            json.dump(settings, f, indent=2)
-            f.write("\n")
-
-        account_label = config_dir.name[len(".claude"):].lstrip("-") or "default"
-        console.print(f"[green]✓[/green] {settings_path}  [dim]({account_label})[/dim]")
-        installed_any = True
+        if changed:
+            with open(settings_path, "w", encoding="utf-8") as f:
+                json.dump(settings, f, indent=2)
+                f.write("\n")
+            console.print(f"[green]✓[/green] {settings_path}  [dim]({account_label})[/dim]")
+            installed_any = True
 
     if installed_any:
         console.print(
-            f"\n[bold]Hook command:[/bold] [cyan]{cctracker_bin} hook-stop[/cyan]\n"
-            "[dim]Restart any open Claude Code sessions for the hook to take effect.[/dim]\n"
+            f"\n[bold]Hooks installed:[/bold]\n"
+            f"  SessionStart → [cyan]{cctracker_bin} hook-start[/cyan]\n"
+            f"  Stop         → [cyan]{cctracker_bin} hook-stop[/cyan]\n"
+            "[dim]Restart any open Claude Code sessions for the hooks to take effect.[/dim]\n"
         )
     else:
-        console.print("\n[dim]Nothing to do — hook already installed everywhere.[/dim]\n")
+        console.print("\n[dim]Nothing to do — hooks already installed everywhere.[/dim]\n")
 
 
 # ── backfill ─────────────────────────────────────────────────────────────────
@@ -293,12 +372,19 @@ def backfill():
             f"{projects_dir}  ({account_label})[/dim]"
         )
 
+        skipped = 0
         for jf in jsonl_files:
             try:
                 data = parse_transcript(str(jf))
+                if data is None:
+                    skipped += 1
+                    continue
                 upsert_session(data)
                 total += 1
             except Exception as e:
                 console.print(f"[dim]  Skipped {jf.name}: {e}[/dim]")
+
+        if skipped:
+            console.print(f"[dim]  Ignored {skipped} ghost session(s) (no conversation)[/dim]")
 
     console.print(f"\n[green]Backfill complete — {total} session(s) imported.[/green]\n")
