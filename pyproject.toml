@@ -32,5 +32,5 @@ dependencies = [
 cctracker = "cctracker.cli:main"
 
 [project.urls]
-Homepage = "https://github.com/your-username/cctracker"
-Issues   = "https://github.com/your-username/cctracker/issues"
+Homepage = "https://github.com/marketplacegeeks/cctracker"
+Issues   = "https://github.com/marketplacegeeks/cctracker/issues"

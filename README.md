@@ -28,7 +28,7 @@ pip install cctracker
 Or install from source:
 
 ```bash
-git clone https://github.com/your-username/cctracker
+git clone https://github.com/marketplacegeeks/cctracker
 cd cctracker
 pip install -e .
 ```
