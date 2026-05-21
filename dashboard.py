@@ -7,7 +7,7 @@ from datetime import date, timedelta
 from pathlib import Path
 
 import uvicorn
-from fastapi import FastAPI
+from fastapi import FastAPI, Query
 from fastapi.responses import HTMLResponse
 
 import base64
@@ -99,38 +99,59 @@ def _shorten_model(m: str) -> str:
 
 # ── data fetch ────────────────────────────────────────────────────────────────
 
-def _fetch_data(account: str | None = None):
+def _fetch_data(account: str | None = None,
+               from_date: str | None = None,
+               to_date: str | None = None):
     conn = _db()
     if conn is None:
         return None
 
-    today_str   = date.today().isoformat()
-    week_ago    = (date.today() - timedelta(days=6)).isoformat()
-    month_ago   = (date.today() - timedelta(days=29)).isoformat()
+    today = date.today()
+    today_str = today.isoformat()
+
+    if from_date is None:
+        from_date = (today - timedelta(days=29)).isoformat()
+    if to_date is None:
+        to_date = today_str
 
     # Build account filter clause — values are internal constants, safe to inline
     af = f"AND account = '{account}'" if account else ""
 
-    def _sum(since: str) -> int:
+    def _sum(since: str, until: str = "9999-12-31") -> int:
         r = conn.execute(
             f"SELECT COALESCE(SUM(total_tokens),0) FROM sessions "
-            f"WHERE total_tokens > 0 AND date >= ? {af}", (since,)
+            f"WHERE total_tokens > 0 AND date >= ? AND date <= ? {af}", (since, until)
         ).fetchone()
         return r[0]
 
-    today_total = _sum(today_str)
-    week_total  = _sum(week_ago)
-    month_total = _sum(month_ago)
-    all_time    = _sum("2000-01-01")
+    def _count(since: str, until: str = "9999-12-31") -> int:
+        r = conn.execute(
+            f"SELECT COUNT(*) FROM sessions "
+            f"WHERE total_tokens > 0 AND date >= ? AND date <= ? {af}", (since, until)
+        ).fetchone()
+        return r[0]
 
-    # yesterday for delta badge
-    yesterday_str = (date.today() - timedelta(days=1)).isoformat()
-    yesterday_total = conn.execute(
-        f"SELECT COALESCE(SUM(total_tokens),0) FROM sessions "
-        f"WHERE total_tokens > 0 AND date = ? {af}", (yesterday_str,)
-    ).fetchone()[0]
+    period_total    = _sum(from_date, to_date)
+    period_sessions = _count(from_date, to_date)
+    all_time        = _sum("2000-01-01")
 
-    # 30-day daily chart
+    # Compute period length and previous-period total for delta badge
+    try:
+        from_dt = date.fromisoformat(from_date)
+        to_dt   = date.fromisoformat(to_date)
+        period_days = max((to_dt - from_dt).days + 1, 1)
+        prev_to   = (from_dt - timedelta(days=1)).isoformat()
+        prev_from = (from_dt - timedelta(days=period_days)).isoformat()
+        prev_total = _sum(prev_from, prev_to)
+        daily_avg  = round(period_total / period_days)
+    except Exception:
+        from_dt = today - timedelta(days=29)
+        to_dt   = today
+        period_days = 30
+        prev_total  = 0
+        daily_avg   = 0
+
+    # Daily chart data for the selected range
     daily_rows = conn.execute(f"""
         SELECT date,
                SUM(total_tokens)  AS total,
@@ -138,63 +159,68 @@ def _fetch_data(account: str | None = None):
                SUM(output_tokens) AS outp,
                COUNT(*)           AS sessions
         FROM sessions
-        WHERE total_tokens > 0 AND date >= ? {af}
+        WHERE total_tokens > 0 AND date >= ? AND date <= ? {af}
         GROUP BY date ORDER BY date
-    """, (month_ago,)).fetchall()
+    """, (from_date, to_date)).fetchall()
     daily_map = {r["date"]: dict(r) for r in daily_rows}
 
     chart_labels, chart_totals, chart_inp, chart_outp, chart_sessions = [], [], [], [], []
-    for i in range(30):
-        d = (date.today() - timedelta(days=29 - i)).isoformat()
-        row = daily_map.get(d, {})
-        chart_labels.append(d[5:])           # MM-DD
+    cur = from_dt
+    while cur <= to_dt:
+        d_str = cur.isoformat()
+        row = daily_map.get(d_str, {})
+        # Use shorter label when range is wide
+        label = d_str[5:7] if period_days > 60 else d_str[5:]
+        chart_labels.append(label)
         chart_totals.append(row.get("total", 0))
         chart_inp.append(row.get("inp", 0))
         chart_outp.append(row.get("outp", 0))
         chart_sessions.append(row.get("sessions", 0))
+        cur += timedelta(days=1)
 
-    # top projects (all time)
+    # top projects in range
     proj_rows = conn.execute(f"""
         SELECT project,
                SUM(total_tokens)  AS total,
                COUNT(*)           AS sessions,
                CAST(AVG(total_tokens) AS INTEGER) AS avg_tok
-        FROM sessions WHERE total_tokens > 0 {af}
+        FROM sessions WHERE total_tokens > 0 AND date >= ? AND date <= ? {af}
         GROUP BY project ORDER BY total DESC LIMIT 12
-    """).fetchall()
+    """, (from_date, to_date)).fetchall()
 
-    # top projects last 7 days
+    # top projects for donut (same range)
     proj_week = conn.execute(f"""
         SELECT project, SUM(total_tokens) AS total, COUNT(*) AS sessions
-        FROM sessions WHERE total_tokens > 0 AND date >= ? {af}
+        FROM sessions WHERE total_tokens > 0 AND date >= ? AND date <= ? {af}
         GROUP BY project ORDER BY total DESC LIMIT 8
-    """, (week_ago,)).fetchall()
+    """, (from_date, to_date)).fetchall()
 
     # recent sessions
     recent = conn.execute(f"""
         SELECT id, date, start_time, end_time, duration_minutes,
                input_tokens, output_tokens, total_tokens,
                project, model, account, achievement, cwd
-        FROM sessions WHERE total_tokens > 0 {af}
+        FROM sessions WHERE total_tokens > 0 AND date >= ? AND date <= ? {af}
         ORDER BY date DESC, start_time DESC LIMIT 40
-    """).fetchall()
+    """, (from_date, to_date)).fetchall()
 
     # model breakdown
     model_rows = conn.execute(f"""
         SELECT model, SUM(total_tokens) AS total, COUNT(*) AS sessions
-        FROM sessions WHERE total_tokens > 0 AND model NOT IN ('pending','unknown') {af}
+        FROM sessions WHERE total_tokens > 0 AND model NOT IN ('pending','unknown')
+        AND date >= ? AND date <= ? {af}
         GROUP BY model ORDER BY total DESC
-    """).fetchall()
+    """, (from_date, to_date)).fetchall()
 
-    # hourly heatmap (hour of day vs tokens — last 30 days)
+    # hourly heatmap
     hourly = conn.execute(f"""
         SELECT CAST(SUBSTR(start_time,1,2) AS INTEGER) AS hr,
                SUM(total_tokens) AS total,
                COUNT(*) AS sessions
         FROM sessions
-        WHERE total_tokens > 0 AND date >= ? AND start_time IS NOT NULL {af}
+        WHERE total_tokens > 0 AND date >= ? AND date <= ? AND start_time IS NOT NULL {af}
         GROUP BY hr ORDER BY hr
-    """, (month_ago,)).fetchall()
+    """, (from_date, to_date)).fetchall()
     hourly_map = {r["hr"]: {"total": r["total"], "sessions": r["sessions"]} for r in hourly}
 
     conn.close()
@@ -206,54 +232,54 @@ def _fetch_data(account: str | None = None):
         rolling.append(round(sum(window) / len(window)))
 
     return {
-        "today_total": today_total,
-        "yesterday_total": yesterday_total,
-        "week_total": week_total,
-        "month_total": month_total,
-        "all_time": all_time,
-        "chart_labels": chart_labels,
-        "chart_totals": chart_totals,
-        "chart_inp": chart_inp,
-        "chart_outp": chart_outp,
-        "chart_sessions": chart_sessions,
-        "rolling": rolling,
-        "proj_rows": [dict(r) for r in proj_rows],
-        "proj_week": [dict(r) for r in proj_week],
-        "recent": [dict(r) for r in recent],
-        "model_rows": [dict(r) for r in model_rows],
-        "hourly_map": hourly_map,
+        "period_total":    period_total,
+        "prev_total":      prev_total,
+        "daily_avg":       daily_avg,
+        "period_sessions": period_sessions,
+        "all_time":        all_time,
+        "chart_labels":    chart_labels,
+        "chart_totals":    chart_totals,
+        "chart_inp":       chart_inp,
+        "chart_outp":      chart_outp,
+        "chart_sessions":  chart_sessions,
+        "rolling":         rolling,
+        "proj_rows":       [dict(r) for r in proj_rows],
+        "proj_week":       [dict(r) for r in proj_week],
+        "recent":          [dict(r) for r in recent],
+        "model_rows":      [dict(r) for r in model_rows],
+        "hourly_map":      hourly_map,
     }
 
 
 # ── HTML sub-builders ─────────────────────────────────────────────────────────
 
 def _cards_html(d: dict) -> str:
-    today_delta = d["today_total"] - d["yesterday_total"]
-    delta_sign  = "+" if today_delta >= 0 else ""
-    delta_color = "#EF4444" if today_delta > 0 else "#10B981"
+    delta       = d["period_total"] - d["prev_total"]
+    delta_sign  = "+" if delta >= 0 else ""
+    delta_color = "#EF4444" if delta > 0 else "#10B981"
 
-    def card(label, value, sub=""):
+    def card(label, value, sub="", fmt_fn=_fmt):
         return f"""
         <div class="card">
           <div class="card-label">{label}</div>
-          <div class="card-value">{_fmt(value)}</div>
+          <div class="card-value">{fmt_fn(value)}</div>
           {f'<div class="card-sub">{sub}</div>' if sub else ""}
         </div>"""
 
     return (
-        card("Today", d["today_total"],
-             f'<span style="color:{delta_color}">{delta_sign}{_fmt(abs(today_delta))} vs yesterday</span>') +
-        card("This Week (7d)", d["week_total"]) +
-        card("This Month (30d)", d["month_total"]) +
+        card("Period Total", d["period_total"],
+             f'<span style="color:{delta_color}">{delta_sign}{_fmt(abs(delta))} vs prev period</span>') +
+        card("Daily Avg", d["daily_avg"]) +
+        card("Sessions", d["period_sessions"], fmt_fn=str) +
         card("All Time", d["all_time"])
     )
 
 
 def _proj_table_html(d: dict) -> str:
     html = ""
-    all_time = d["all_time"] or 1
+    period_total = d["period_total"] or 1
     for r in d["proj_rows"]:
-        pct = round(r["total"] / all_time * 100, 1) if all_time else 0
+        pct = round(r["total"] / period_total * 100, 1) if period_total else 0
         html += f"""
         <tr>
           <td class="td-project">{r["project"] or "—"}</td>
@@ -344,7 +370,7 @@ def _chart_js_data(d: dict) -> dict:
 
 # ── HTML builder ──────────────────────────────────────────────────────────────
 
-def _html(views: dict) -> str:
+def _html(views: dict, from_date: str = "", to_date: str = "") -> str:
     # views keys: "all", "personal", "litellm"
     tab_defs = [
         ("all",      "All"),
@@ -422,6 +448,17 @@ def _html(views: dict) -> str:
   .refresh-btn {{ background:var(--border); border:none; color:var(--text); padding:5px 12px; border-radius:6px; cursor:pointer; font-size:12px; }}
   .refresh-btn:hover {{ background:#3A3D4E; }}
 
+  /* Date range filter */
+  .date-filter {{ display:flex; align-items:center; gap:6px; }}
+  .preset {{ background:var(--border); border:none; color:var(--muted); padding:4px 9px; border-radius:5px; cursor:pointer; font-size:11px; font-weight:500; transition:background 0.1s,color 0.1s; }}
+  .preset:hover {{ background:#3A3D4E; color:var(--text); }}
+  .preset.active-preset {{ background:var(--blue); color:#fff; }}
+  .date-input {{ background:var(--border); border:1px solid var(--border); color:var(--text); padding:4px 8px; border-radius:5px; font-size:11px; width:108px; cursor:pointer; }}
+  .date-input:focus {{ outline:none; border-color:var(--blue); }}
+  .date-sep {{ color:var(--muted); font-size:12px; }}
+  .apply-btn {{ background:var(--blue); border:none; color:#fff; padding:4px 12px; border-radius:5px; cursor:pointer; font-size:11px; font-weight:600; }}
+  .apply-btn:hover {{ background:#2563EB; }}
+
   /* Tab bar */
   .tab-bar {{ background:var(--surface); border-bottom:1px solid var(--border); padding:0 24px; display:flex; align-items:center; gap:2px; }}
   .tab-btn {{ background:none; border:none; color:var(--muted); padding:10px 16px; font-size:13px; font-weight:500; cursor:pointer; border-bottom:2px solid transparent; margin-bottom:-1px; transition:color 0.15s, border-color 0.15s; }}
@@ -483,6 +520,17 @@ def _html(views: dict) -> str:
 <div class="topbar">
   <div class="topbar-logo">{"<img src='" + _LOGO_B64 + "' alt='logo'>" if _LOGO_B64 else ""}cc<span>tracker</span> &nbsp;·&nbsp; Token Dashboard</div>
   <div style="display:flex;gap:12px;align-items:center">
+    <div class="date-filter">
+      <button class="preset" onclick="setPreset(0)">Today</button>
+      <button class="preset" onclick="setPreset(7)">7D</button>
+      <button class="preset" onclick="setPreset(30)">30D</button>
+      <button class="preset" onclick="setPreset(90)">90D</button>
+      <button class="preset" onclick="setPreset(-1)">All</button>
+      <input type="date" id="from-date" class="date-input" value="{from_date}" onchange="clearPresets()">
+      <span class="date-sep">→</span>
+      <input type="date" id="to-date" class="date-input" value="{to_date}" onchange="clearPresets()">
+      <button class="apply-btn" onclick="applyFilter()">Apply</button>
+    </div>
     <span class="topbar-meta" id="last-updated">Loading…</span>
     <button class="refresh-btn" onclick="location.reload()">↻ Refresh</button>
   </div>
@@ -501,11 +549,11 @@ def _html(views: dict) -> str:
   <!-- 30-day chart + weekly projects -->
   <div class="charts-row">
     <div class="chart-card">
-      <div class="section-title">Daily Token Usage — last 30 days</div>
+      <div class="section-title">Daily Token Usage — {from_date} → {to_date}</div>
       <div class="chart-wrap"><canvas id="dailyChart"></canvas></div>
     </div>
     <div class="chart-card">
-      <div class="section-title">This Week by Project</div>
+      <div class="section-title">Top Projects in Period</div>
       <div class="chart-wrap"><canvas id="weekProjChart"></canvas></div>
     </div>
   </div>
@@ -513,7 +561,7 @@ def _html(views: dict) -> str:
   <!-- Projects table + hourly heatmap -->
   <div class="bottom-row">
     <div class="chart-card">
-      <div class="section-title">All-Time — Top Projects</div>
+      <div class="section-title">Top Projects in Period</div>
       <div class="table-scroll">
         <table>
           <thead><tr>
@@ -531,7 +579,7 @@ def _html(views: dict) -> str:
         <div class="chart-wrap" style="height:130px"><canvas id="modelChart"></canvas></div>
       </div>
       <div class="chart-card" style="flex:1">
-        <div class="section-title">Peak Hours (last 30 days)</div>
+        <div class="section-title">Peak Hours in Period</div>
         {heatmap_html_all}
       </div>
     </div>
@@ -728,6 +776,65 @@ modelChart    = buildModelChart('all');
 
 // Auto-refresh every 60 seconds
 setTimeout(() => location.reload(), 60_000);
+
+// ── Date range filter ────────────────────────────────────────────────────────
+
+function _todayStr() {{
+  return new Date().toISOString().split('T')[0];
+}}
+
+function setPreset(days) {{
+  const today = _todayStr();
+  let from;
+  if (days === 0) {{
+    from = today;
+  }} else if (days === -1) {{
+    from = '2000-01-01';
+  }} else {{
+    const d = new Date();
+    d.setDate(d.getDate() - (days - 1));
+    from = d.toISOString().split('T')[0];
+  }}
+  document.getElementById('from-date').value = from;
+  document.getElementById('to-date').value = today;
+  document.querySelectorAll('.preset').forEach(b => b.classList.remove('active-preset'));
+  event.currentTarget.classList.add('active-preset');
+  applyFilter();
+}}
+
+function clearPresets() {{
+  document.querySelectorAll('.preset').forEach(b => b.classList.remove('active-preset'));
+}}
+
+function applyFilter() {{
+  const from = document.getElementById('from-date').value;
+  const to   = document.getElementById('to-date').value;
+  if (!from || !to) return;
+  const url = new URL(location.href);
+  url.searchParams.set('from_date', from);
+  url.searchParams.set('to_date', to);
+  location.href = url.toString();
+}}
+
+// Highlight preset that matches the current URL params on load
+(function() {{
+  const params = new URLSearchParams(location.search);
+  const from = params.get('from_date');
+  const to   = params.get('to_date');
+  if (!from || !to) return;
+  const today = _todayStr();
+  if (to !== today) return;
+  const days = Math.round((new Date(today) - new Date(from)) / 86400000) + 1;
+  const map = {{ 1: 0, 7: 7, 30: 30, 90: 90 }};
+  document.querySelectorAll('.preset').forEach(b => {{
+    const label = b.textContent.trim();
+    if (label === 'Today' && days === 1) b.classList.add('active-preset');
+    else if (label === '7D'  && days === 7)  b.classList.add('active-preset');
+    else if (label === '30D' && days === 30) b.classList.add('active-preset');
+    else if (label === '90D' && days === 90) b.classList.add('active-preset');
+    else if (label === 'All' && from === '2000-01-01') b.classList.add('active-preset');
+  }});
+}})();
 </script>
 </body>
 </html>"""
@@ -736,19 +843,32 @@ setTimeout(() => location.reload(), 60_000);
 # ── Route ─────────────────────────────────────────────────────────────────────
 
 @app.get("/", response_class=HTMLResponse)
-def dashboard():
-    data_all      = _fetch_data()
+def dashboard(
+    from_date: str | None = Query(default=None),
+    to_date:   str | None = Query(default=None),
+):
+    today = date.today()
+    if from_date is None:
+        from_date = (today - timedelta(days=29)).isoformat()
+    if to_date is None:
+        to_date = today.isoformat()
+
+    data_all = _fetch_data(from_date=from_date, to_date=to_date)
     if data_all is None:
         return HTMLResponse("<h2 style='color:white;padding:40px;font-family:sans-serif'>"
                             "No database found at ~/.cctracker/sessions.db<br>"
                             "Run <code>cctracker backfill</code> first.</h2>", status_code=503)
-    data_personal = _fetch_data("personal")
-    data_work     = _fetch_data("work")
-    return _html({
-        "all":      data_all,
-        "personal": data_personal,
-        "litellm":  data_work,
-    })
+    data_personal = _fetch_data("personal", from_date=from_date, to_date=to_date)
+    data_work     = _fetch_data("work",     from_date=from_date, to_date=to_date)
+    return _html(
+        {
+            "all":      data_all,
+            "personal": data_personal,
+            "litellm":  data_work,
+        },
+        from_date=from_date,
+        to_date=to_date,
+    )
 
 
 @app.get("/healthz")
