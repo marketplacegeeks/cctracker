@@ -568,7 +568,22 @@ def _html(views: dict, from_date: str = "", to_date: str = "") -> str:
   .pill {{ display:inline-block; padding:2px 7px; border-radius:20px; font-size:10px; font-weight:600; background:var(--border); color:var(--muted); }}
 
   /* Session table controls */
-  .sessions-toolbar {{ display:flex; align-items:center; justify-content:space-between; margin-bottom:12px; }}
+  .sessions-toolbar {{ display:flex; align-items:center; justify-content:space-between; margin-bottom:10px; }}
+  /* Filter bar */
+  .filter-bar {{ display:flex; align-items:center; gap:12px; flex-wrap:wrap; padding:10px 12px; background:rgba(59,130,246,0.04); border:1px solid var(--border); border-radius:8px; margin-bottom:10px; }}
+  .filter-group {{ display:flex; align-items:center; gap:6px; }}
+  .filter-label {{ font-size:10px; font-weight:600; text-transform:uppercase; letter-spacing:0.5px; color:var(--muted); white-space:nowrap; }}
+  .filter-date, .filter-select, .filter-num {{ background:var(--surface); border:1px solid var(--border); color:var(--text); padding:4px 8px; border-radius:5px; font-size:12px; }}
+  .filter-date {{ width:118px; }}
+  .filter-select {{ min-width:110px; cursor:pointer; }}
+  .filter-num {{ width:80px; }}
+  .filter-date:focus, .filter-select:focus, .filter-num:focus {{ outline:none; border-color:var(--blue); }}
+  .filter-sep {{ color:var(--muted); font-size:11px; }}
+  .filter-divider {{ width:1px; height:20px; background:var(--border); }}
+  .clear-filters-btn {{ margin-left:auto; background:none; border:1px solid var(--border); color:var(--muted); padding:3px 10px; border-radius:5px; cursor:pointer; font-size:11px; white-space:nowrap; }}
+  .clear-filters-btn:hover {{ border-color:var(--red); color:var(--red); }}
+  /* Session table controls */
+  .sessions-toolbar {{ display:flex; align-items:center; justify-content:space-between; margin-bottom:10px; }}
   .sessions-toolbar-right {{ display:flex; align-items:center; gap:8px; }}
   .filter-input {{ background:var(--border); border:1px solid var(--border); color:var(--text); padding:4px 10px; border-radius:5px; font-size:12px; width:180px; }}
   .filter-input:focus {{ outline:none; border-color:var(--blue); }}
@@ -673,6 +688,31 @@ def _html(views: dict, from_date: str = "", to_date: str = "") -> str:
           <div id="col-menu" class="col-menu" style="display:none"></div>
         </div>
       </div>
+    </div>
+    <div class="filter-bar">
+      <div class="filter-group">
+        <span class="filter-label">Date</span>
+        <input type="date" id="f-date-from" class="filter-date" oninput="applyFilters()">
+        <span class="filter-sep">→</span>
+        <input type="date" id="f-date-to" class="filter-date" oninput="applyFilters()">
+      </div>
+      <div class="filter-divider"></div>
+      <div class="filter-group">
+        <span class="filter-label">Model</span>
+        <select id="f-model" class="filter-select" onchange="applyFilters()"><option value="">All</option></select>
+      </div>
+      <div class="filter-group">
+        <span class="filter-label">Account</span>
+        <select id="f-account" class="filter-select" onchange="applyFilters()"><option value="">All</option></select>
+      </div>
+      <div class="filter-divider"></div>
+      <div class="filter-group">
+        <span class="filter-label">Tokens</span>
+        <input type="number" id="f-tok-min" class="filter-num" placeholder="Min" oninput="applyFilters()">
+        <span class="filter-sep">–</span>
+        <input type="number" id="f-tok-max" class="filter-num" placeholder="Max" oninput="applyFilters()">
+      </div>
+      <button class="clear-filters-btn" onclick="clearFilters()">✕ Clear</button>
     </div>
     <div class="table-scroll">
       <table id="sessions-table">
@@ -851,8 +891,9 @@ function switchView(view) {{
   modelChart    = buildModelChart(view);
 
   sessionPage = 1;
-  renderSessionTable();
   currentView = view;
+  populateFilterOptions();
+  renderSessionTable();
 }}
 
 // Initial chart render
@@ -922,9 +963,9 @@ const COL_DEFS = [
 
 let colVisibility = Object.fromEntries(COL_DEFS.map(c => [c.key, !c.optional]));
 let sessionSort   = {{ key:'date', dir:'desc' }};
-let sessionFilter = '';
 let sessionPage   = 1;
 const PAGE_SIZE   = 20;
+let tableFilters  = {{ text:'', dateFrom:'', dateTo:'', model:'', account:'', tokMin:null, tokMax:null }};
 
 function _esc(s) {{
   return String(s||'').replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/"/g,'&quot;');
@@ -969,15 +1010,24 @@ function renderSessionTable() {{
   const rows = sessionData[currentView] || [];
 
   // Filter
-  const q = sessionFilter.toLowerCase();
-  let filtered = q ? rows.filter(r =>
-    (r.project||'').toLowerCase().includes(q) ||
-    (r.summary||'').toLowerCase().includes(q) ||
-    (r.model_short||'').toLowerCase().includes(q) ||
-    (r.cwd_short||'').toLowerCase().includes(q) ||
-    (r.account||'').toLowerCase().includes(q) ||
-    (r.date||'').includes(q)
-  ) : rows;
+  const q = tableFilters.text.toLowerCase();
+  let filtered = rows.filter(r => {{
+    if (q && !(
+      (r.project||'').toLowerCase().includes(q) ||
+      (r.summary||'').toLowerCase().includes(q) ||
+      (r.model_short||'').toLowerCase().includes(q) ||
+      (r.cwd_short||'').toLowerCase().includes(q) ||
+      (r.account||'').toLowerCase().includes(q) ||
+      (r.date||'').includes(q)
+    )) return false;
+    if (tableFilters.dateFrom && (r.date||'') < tableFilters.dateFrom) return false;
+    if (tableFilters.dateTo   && (r.date||'') > tableFilters.dateTo)   return false;
+    if (tableFilters.model    && r.model_short !== tableFilters.model)  return false;
+    if (tableFilters.account  && r.account !== tableFilters.account)    return false;
+    if (tableFilters.tokMin !== null && (r.total_tokens||0) < tableFilters.tokMin) return false;
+    if (tableFilters.tokMax !== null && (r.total_tokens||0) > tableFilters.tokMax) return false;
+    return true;
+  }});
 
   // Sort
   filtered = [...filtered].sort((a, b) => {{
@@ -1048,9 +1098,46 @@ function sortSession(key) {{
 }}
 
 function onFilterChange() {{
-  sessionFilter = document.getElementById('session-filter').value;
-  sessionPage   = 1;
+  tableFilters.text = document.getElementById('session-filter').value;
+  sessionPage = 1;
   renderSessionTable();
+}}
+
+function applyFilters() {{
+  const v = id => document.getElementById(id).value;
+  tableFilters.dateFrom = v('f-date-from');
+  tableFilters.dateTo   = v('f-date-to');
+  tableFilters.model    = v('f-model');
+  tableFilters.account  = v('f-account');
+  const mn = v('f-tok-min'), mx = v('f-tok-max');
+  tableFilters.tokMin = mn ? +mn : null;
+  tableFilters.tokMax = mx ? +mx : null;
+  sessionPage = 1;
+  renderSessionTable();
+}}
+
+function clearFilters() {{
+  ['f-date-from','f-date-to','f-tok-min','f-tok-max'].forEach(id => document.getElementById(id).value = '');
+  document.getElementById('f-model').value   = '';
+  document.getElementById('f-account').value = '';
+  document.getElementById('session-filter').value = '';
+  tableFilters = {{ text:'', dateFrom:'', dateTo:'', model:'', account:'', tokMin:null, tokMax:null }};
+  sessionPage  = 1;
+  renderSessionTable();
+}}
+
+function populateFilterOptions() {{
+  const rows = sessionData[currentView] || [];
+  const models   = [...new Set(rows.map(r => r.model_short).filter(Boolean))].sort();
+  const accounts = [...new Set(rows.map(r => r.account).filter(Boolean))].sort();
+  const mSel = document.getElementById('f-model');
+  const cur  = mSel.value;
+  mSel.innerHTML = '<option value="">All Models</option>' +
+    models.map(m => `<option value="${{m}}" ${{m===cur?'selected':''}}>${{m}}</option>`).join('');
+  const aSel = document.getElementById('f-account');
+  const curA = aSel.value;
+  aSel.innerHTML = '<option value="">All Accounts</option>' +
+    accounts.map(a => `<option value="${{a}}" ${{a===curA?'selected':''}}>${{a}}</option>`).join('');
 }}
 
 function toggleColMenu(e) {{
@@ -1074,6 +1161,7 @@ document.addEventListener('click', () => {{
 }});
 
 // Initial render (must come after all declarations above)
+populateFilterOptions();
 renderSessionTable();
 
 // ── Date range filter ─────────────────────────────────────────────────────────
