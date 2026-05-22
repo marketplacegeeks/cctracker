@@ -243,12 +243,18 @@ def _fetch_data(account: str | None = None,
                input_tokens, output_tokens, total_tokens,
                project, model, account, achievement, cwd, transcript_path
         FROM sessions WHERE total_tokens > 0 AND date >= ? AND date <= ? {af}
-        ORDER BY date DESC, start_time DESC LIMIT 40
+        ORDER BY date DESC, start_time DESC LIMIT 200
     """, (from_date, to_date)).fetchall()
     recent_enriched = []
     for r in recent:
         row = dict(r)
         row["summary"] = row.get("achievement") or _first_user_msg(row.get("transcript_path"))
+        row["cwd_short"] = _abbrev_cwd(row.get("cwd") or "")
+        row["model_short"] = _shorten_model(row.get("model") or "—")
+        inp = row.get("input_tokens") or 0
+        out = row.get("output_tokens") or 0
+        row["ratio"] = f"{round(inp/(inp+out)*100)}% in" if (inp + out) > 0 else "—"
+        row.pop("transcript_path", None)
         recent_enriched.append(row)
 
     # model breakdown
@@ -432,9 +438,9 @@ def _html(views: dict, from_date: str = "", to_date: str = "") -> str:
     # Pre-render per-view HTML blocks
     cards_blocks   = {k: _cards_html(views[k])      for k in views}
     proj_blocks    = {k: _proj_table_html(views[k])  for k in views}
-    recent_blocks  = {k: _recent_html(views[k])      for k in views}
     heatmap_blocks = {k: _heatmap_html(views[k])     for k in views}
     chart_js       = {k: _chart_js_data(views[k])    for k in views}
+    session_data   = {k: views[k]["recent"]          for k in views}
 
     # Build tab buttons
     tab_buttons = ""
@@ -454,19 +460,14 @@ def _html(views: dict, from_date: str = "", to_date: str = "") -> str:
         display = "" if i == 0 else ' style="display:none"'
         proj_html_all += f'<tbody id="v-proj-{key}" data-view="{key}"{display}>{proj_blocks[key]}</tbody>'
 
-    # Recent sections
-    recent_html_all = ""
-    for i, (key, _) in enumerate(tab_defs):
-        display = "" if i == 0 else ' style="display:none"'
-        recent_html_all += f'<tbody id="v-recent-{key}" data-view="{key}"{display}>{recent_blocks[key]}</tbody>'
-
     # Heatmap sections
     heatmap_html_all = ""
     for i, (key, _) in enumerate(tab_defs):
         display = "" if i == 0 else ' style="display:none"'
         heatmap_html_all += f'<div id="v-heatmap-{key}" class="heatmap" data-view="{key}"{display}>{heatmap_blocks[key]}</div>'
 
-    chart_js_json = json.dumps(chart_js)
+    chart_js_json      = json.dumps(chart_js)
+    session_data_json  = json.dumps(session_data)
 
     return f"""<!DOCTYPE html>
 <html lang="en">
@@ -565,6 +566,30 @@ def _html(views: dict, from_date: str = "", to_date: str = "") -> str:
 
   /* Model pills */
   .pill {{ display:inline-block; padding:2px 7px; border-radius:20px; font-size:10px; font-weight:600; background:var(--border); color:var(--muted); }}
+
+  /* Session table controls */
+  .sessions-toolbar {{ display:flex; align-items:center; justify-content:space-between; margin-bottom:12px; }}
+  .sessions-toolbar-right {{ display:flex; align-items:center; gap:8px; }}
+  .filter-input {{ background:var(--border); border:1px solid var(--border); color:var(--text); padding:4px 10px; border-radius:5px; font-size:12px; width:180px; }}
+  .filter-input:focus {{ outline:none; border-color:var(--blue); }}
+  .col-toggle-btn {{ background:var(--border); border:none; color:var(--text); padding:4px 10px; border-radius:5px; cursor:pointer; font-size:12px; white-space:nowrap; }}
+  .col-toggle-btn:hover {{ background:#3A3D4E; }}
+  .col-menu-wrap {{ position:relative; }}
+  .col-menu {{ position:absolute; right:0; top:calc(100% + 4px); background:var(--surface); border:1px solid var(--border); border-radius:8px; padding:6px; min-width:150px; z-index:100; box-shadow:0 4px 16px rgba(0,0,0,0.4); }}
+  .col-check {{ display:flex; align-items:center; gap:8px; padding:5px 8px; font-size:12px; cursor:pointer; border-radius:4px; white-space:nowrap; }}
+  .col-check:hover {{ background:var(--border); }}
+  .col-check input {{ accent-color:var(--blue); cursor:pointer; }}
+  /* Pagination */
+  .pagination {{ display:flex; align-items:center; justify-content:space-between; padding:10px 0 0; border-top:1px solid var(--border); margin-top:6px; }}
+  .pg-info {{ font-size:11px; color:var(--muted); }}
+  .pg-btns {{ display:flex; gap:3px; }}
+  .pg-btn {{ background:var(--border); border:none; color:var(--text); padding:3px 9px; border-radius:5px; cursor:pointer; font-size:12px; }}
+  .pg-btn:hover:not([disabled]) {{ background:#3A3D4E; }}
+  .pg-btn[disabled] {{ opacity:0.35; cursor:default; }}
+  .pg-btn.pg-active {{ background:var(--blue); color:#fff; }}
+  /* Sortable headers */
+  th.sortable {{ cursor:pointer; user-select:none; }}
+  th.sortable:hover {{ color:var(--text); }}
 </style>
 </head>
 <body>
@@ -639,23 +664,30 @@ def _html(views: dict, from_date: str = "", to_date: str = "") -> str:
 
   <!-- Recent sessions -->
   <div class="sessions-card">
-    <div class="section-title">Recent Sessions</div>
+    <div class="sessions-toolbar">
+      <div class="section-title" style="margin:0">Recent Sessions</div>
+      <div class="sessions-toolbar-right">
+        <input type="text" id="session-filter" class="filter-input" placeholder="Filter sessions…" oninput="onFilterChange()">
+        <div class="col-menu-wrap">
+          <button class="col-toggle-btn" onclick="toggleColMenu(event)">Columns ▾</button>
+          <div id="col-menu" class="col-menu" style="display:none"></div>
+        </div>
+      </div>
+    </div>
     <div class="table-scroll">
-      <table>
-        <thead><tr>
-          <th>Date</th><th>Time</th><th>Project</th><th>Working Dir</th>
-          <th class="td-right">Tokens</th><th class="td-right">Ratio</th>
-          <th class="td-right">Dur</th><th>Model</th><th>Summary</th>
-        </tr></thead>
-        {recent_html_all}
+      <table id="sessions-table">
+        <thead id="sessions-thead"></thead>
+        <tbody id="sessions-tbody"></tbody>
       </table>
     </div>
+    <div id="sessions-pagination" class="pagination"></div>
   </div>
 
 </div><!-- /main -->
 
 <script>
-const chartData = {chart_js_json};
+const chartData   = {chart_js_json};
+const sessionData = {session_data_json};
 const gridColor = 'rgba(42,45,62,0.8)';
 const textColor = '#6B7280';
 
@@ -804,7 +836,7 @@ function switchView(view) {{
   document.getElementById('tab-' + view).classList.add('tab-active');
 
   // Show/hide view-specific HTML blocks
-  ['cards', 'proj', 'recent', 'heatmap'].forEach(kind => {{
+  ['cards', 'proj', 'heatmap'].forEach(kind => {{
     document.querySelectorAll(`[id^="v-${{kind}}-"]`).forEach(el => {{
       el.style.display = el.dataset.view === view ? '' : 'none';
     }});
@@ -818,6 +850,8 @@ function switchView(view) {{
   weekProjChart = buildWeekProjChart(view);
   modelChart    = buildModelChart(view);
 
+  sessionPage = 1;
+  renderSessionTable();
   currentView = view;
 }}
 
@@ -867,6 +901,182 @@ function applyFilter() {{
   url.searchParams.set('to_date', to);
   location.href = url.toString();
 }}
+
+// ── Session table ─────────────────────────────────────────────────────────────
+
+const COL_DEFS = [
+  {{ key:'date',           label:'Date',       sortable:true,  align:'',      optional:false }},
+  {{ key:'start_time',     label:'Time',       sortable:true,  align:'',      optional:false }},
+  {{ key:'project',        label:'Project',    sortable:true,  align:'',      optional:false }},
+  {{ key:'cwd_short',      label:'Working Dir',sortable:false, align:'',      optional:false }},
+  {{ key:'total_tokens',   label:'Tokens',     sortable:true,  align:'right', optional:false }},
+  {{ key:'ratio',          label:'Ratio',      sortable:false, align:'right', optional:false }},
+  {{ key:'duration_minutes',label:'Dur',       sortable:true,  align:'right', optional:false }},
+  {{ key:'model_short',    label:'Model',      sortable:true,  align:'',      optional:false }},
+  {{ key:'summary',        label:'Summary',    sortable:false, align:'',      optional:false }},
+  {{ key:'input_tokens',   label:'Input Tok',  sortable:true,  align:'right', optional:true  }},
+  {{ key:'output_tokens',  label:'Output Tok', sortable:true,  align:'right', optional:true  }},
+  {{ key:'account',        label:'Account',    sortable:true,  align:'',      optional:true  }},
+  {{ key:'end_time',       label:'End Time',   sortable:true,  align:'',      optional:true  }},
+];
+
+let colVisibility = Object.fromEntries(COL_DEFS.map(c => [c.key, !c.optional]));
+let sessionSort   = {{ key:'date', dir:'desc' }};
+let sessionFilter = '';
+let sessionPage   = 1;
+const PAGE_SIZE   = 20;
+
+function _esc(s) {{
+  return String(s||'').replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/"/g,'&quot;');
+}}
+
+function _fmtTok(n) {{
+  if (!n) return '0';
+  if (n >= 1e9) return (n/1e9).toFixed(2)+'B';
+  if (n >= 1e6) return (n/1e6).toFixed(1)+'M';
+  if (n >= 1e3) return (n/1e3).toFixed(1)+'K';
+  return String(n);
+}}
+
+function _tokColor(n) {{
+  if (!n)        return '#6B7280';
+  if (n < 50000)   return '#10B981';
+  if (n < 500000)  return '#F59E0B';
+  if (n < 2000000) return '#F97316';
+  return '#EF4444';
+}}
+
+function _cellHtml(row, col) {{
+  switch (col.key) {{
+    case 'total_tokens':
+      return `<span style="color:${{_tokColor(row.total_tokens)}};font-weight:600">${{_fmtTok(row.total_tokens)}}</span>`;
+    case 'input_tokens':  return _fmtTok(row.input_tokens);
+    case 'output_tokens': return _fmtTok(row.output_tokens);
+    case 'duration_minutes': return row.duration_minutes ? row.duration_minutes + 'm' : '—';
+    case 'cwd_short':
+      return `<span title="${{_esc(row.cwd||'')}}">${{_esc(row.cwd_short||'')}}</span>`;
+    case 'summary': {{
+      const s = row.summary || '';
+      const short = s.length > 100 ? s.slice(0,100) + '…' : s;
+      return `<span title="${{_esc(s)}}">${{_esc(short)}}</span>`;
+    }}
+    default:
+      return _esc(row[col.key]);
+  }}
+}}
+
+function renderSessionTable() {{
+  const rows = sessionData[currentView] || [];
+
+  // Filter
+  const q = sessionFilter.toLowerCase();
+  let filtered = q ? rows.filter(r =>
+    (r.project||'').toLowerCase().includes(q) ||
+    (r.summary||'').toLowerCase().includes(q) ||
+    (r.model_short||'').toLowerCase().includes(q) ||
+    (r.cwd_short||'').toLowerCase().includes(q) ||
+    (r.account||'').toLowerCase().includes(q) ||
+    (r.date||'').includes(q)
+  ) : rows;
+
+  // Sort
+  filtered = [...filtered].sort((a, b) => {{
+    let av = a[sessionSort.key], bv = b[sessionSort.key];
+    if (av == null) av = ''; if (bv == null) bv = '';
+    const cmp = typeof av === 'number' ? av - bv : String(av).localeCompare(String(bv));
+    return sessionSort.dir === 'asc' ? cmp : -cmp;
+  }});
+
+  // Pagination
+  const total  = filtered.length;
+  const pages  = Math.max(1, Math.ceil(total / PAGE_SIZE));
+  sessionPage  = Math.min(Math.max(1, sessionPage), pages);
+  const start  = (sessionPage - 1) * PAGE_SIZE;
+  const pageRows = filtered.slice(start, start + PAGE_SIZE);
+  const visCols  = COL_DEFS.filter(c => colVisibility[c.key]);
+
+  // Thead
+  document.getElementById('sessions-thead').innerHTML = '<tr>' +
+    visCols.map(c => {{
+      const isActive = sessionSort.key === c.key;
+      const arrow    = isActive ? (sessionSort.dir === 'asc' ? ' ↑' : ' ↓') : '';
+      const cls      = c.sortable ? 'sortable' : '';
+      const align    = c.align === 'right' ? 'text-align:right' : '';
+      const onclick  = c.sortable ? `onclick="sortSession('${{c.key}}')"` : '';
+      return `<th class="${{cls}}" style="${{align}}" ${{onclick}}>${{c.label}}${{arrow}}</th>`;
+    }}).join('') + '</tr>';
+
+  // Tbody
+  const tbody = document.getElementById('sessions-tbody');
+  if (!pageRows.length) {{
+    tbody.innerHTML = `<tr><td colspan="${{visCols.length}}" style="color:#6B7280;text-align:center;padding:24px">No sessions</td></tr>`;
+  }} else {{
+    tbody.innerHTML = pageRows.map(row =>
+      '<tr>' + visCols.map(c => {{
+        const align = c.align === 'right' ? 'text-align:right' : '';
+        const dim   = ['date','start_time','end_time','cwd_short','ratio','duration_minutes','model_short','account'].includes(c.key)
+                      ? 'color:var(--muted)' : '';
+        const cls   = c.key === 'summary' ? 'td-summary' : c.key === 'cwd_short' ? 'td-cwd' : '';
+        return `<td class="${{cls}}" style="${{[align,dim].filter(Boolean).join(';')}}">${{_cellHtml(row,c)}}</td>`;
+      }}).join('') + '</tr>'
+    ).join('');
+  }}
+
+  // Pagination
+  const pgEl = document.getElementById('sessions-pagination');
+  if (pages <= 1) {{ pgEl.innerHTML = ''; return; }}
+  let pgHtml = `<span class="pg-info">${{total}} sessions &nbsp;·&nbsp; Page ${{sessionPage}} of ${{pages}}</span><div class="pg-btns">`;
+  pgHtml += `<button class="pg-btn" onclick="goPage(1)" ${{sessionPage===1?'disabled':''}}>«</button>`;
+  pgHtml += `<button class="pg-btn" onclick="goPage(${{sessionPage-1}})" ${{sessionPage===1?'disabled':''}}>‹</button>`;
+  const lo = Math.max(1, sessionPage-2), hi = Math.min(pages, sessionPage+2);
+  for (let p = lo; p <= hi; p++)
+    pgHtml += `<button class="pg-btn${{p===sessionPage?' pg-active':''}}" onclick="goPage(${{p}})">${{p}}</button>`;
+  pgHtml += `<button class="pg-btn" onclick="goPage(${{sessionPage+1}})" ${{sessionPage===pages?'disabled':''}}>›</button>`;
+  pgHtml += `<button class="pg-btn" onclick="goPage(${{pages}})" ${{sessionPage===pages?'disabled':''}}>»</button>`;
+  pgHtml += '</div>';
+  pgEl.innerHTML = pgHtml;
+}}
+
+function goPage(p)    {{ sessionPage = p; renderSessionTable(); }}
+
+function sortSession(key) {{
+  sessionSort = sessionSort.key === key
+    ? {{ key, dir: sessionSort.dir === 'asc' ? 'desc' : 'asc' }}
+    : {{ key, dir: 'desc' }};
+  sessionPage = 1;
+  renderSessionTable();
+}}
+
+function onFilterChange() {{
+  sessionFilter = document.getElementById('session-filter').value;
+  sessionPage   = 1;
+  renderSessionTable();
+}}
+
+function toggleColMenu(e) {{
+  e.stopPropagation();
+  const menu = document.getElementById('col-menu');
+  if (menu.style.display !== 'none') {{ menu.style.display = 'none'; return; }}
+  menu.innerHTML = COL_DEFS.filter(c => c.optional).map(c =>
+    `<label class="col-check"><input type="checkbox" ${{colVisibility[c.key]?'checked':''}}
+      onchange="toggleCol('${{c.key}}',this.checked)"> ${{c.label}}</label>`
+  ).join('');
+  menu.style.display = 'block';
+}}
+
+function toggleCol(key, visible) {{
+  colVisibility[key] = visible;
+  renderSessionTable();
+}}
+
+document.addEventListener('click', () => {{
+  document.getElementById('col-menu').style.display = 'none';
+}});
+
+// Initial render (must come after all declarations above)
+renderSessionTable();
+
+// ── Date range filter ─────────────────────────────────────────────────────────
 
 // Highlight preset that matches the current URL params on load
 (function() {{
