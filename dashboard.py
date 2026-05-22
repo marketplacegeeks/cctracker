@@ -78,6 +78,48 @@ def _color(n: int) -> str:
     return "#EF4444"
 
 
+def _clean_user_text(text: str) -> str:
+    """Strip injected CWD prefix and skip system-tag-only messages."""
+    import re
+    text = text.strip()
+    if not text or text.startswith("<"):
+        return ""
+    # Strip leading quoted path: '/some/path' <actual question>
+    m = re.match(r"^'[^']*'\s*", text)
+    if m:
+        text = text[m.end():].strip()
+    return text
+
+
+def _first_user_msg(transcript_path: str | None) -> str:
+    """Extract the first meaningful user message from a session transcript JSONL."""
+    if not transcript_path:
+        return ""
+    try:
+        with open(transcript_path, encoding="utf-8", errors="ignore") as f:
+            for line in f:
+                try:
+                    row = json.loads(line)
+                except json.JSONDecodeError:
+                    continue
+                if row.get("type") != "user":
+                    continue
+                content = row.get("message", {}).get("content", "")
+                if isinstance(content, list):
+                    for c in content:
+                        if isinstance(c, dict) and c.get("type") == "text":
+                            text = _clean_user_text(c["text"])
+                            if text:
+                                return text
+                elif isinstance(content, str):
+                    text = _clean_user_text(content)
+                    if text:
+                        return text
+    except Exception:
+        pass
+    return ""
+
+
 def _abbrev_cwd(cwd: str) -> str:
     """Return the last 2 path components as a short label, e.g. 'Docs_Content/AI Content'."""
     if not cwd:
@@ -199,10 +241,15 @@ def _fetch_data(account: str | None = None,
     recent = conn.execute(f"""
         SELECT id, date, start_time, end_time, duration_minutes,
                input_tokens, output_tokens, total_tokens,
-               project, model, account, achievement, cwd
+               project, model, account, achievement, cwd, transcript_path
         FROM sessions WHERE total_tokens > 0 AND date >= ? AND date <= ? {af}
         ORDER BY date DESC, start_time DESC LIMIT 40
     """, (from_date, to_date)).fetchall()
+    recent_enriched = []
+    for r in recent:
+        row = dict(r)
+        row["summary"] = row.get("achievement") or _first_user_msg(row.get("transcript_path"))
+        recent_enriched.append(row)
 
     # model breakdown
     model_rows = conn.execute(f"""
@@ -245,7 +292,7 @@ def _fetch_data(account: str | None = None,
         "rolling":         rolling,
         "proj_rows":       [dict(r) for r in proj_rows],
         "proj_week":       [dict(r) for r in proj_week],
-        "recent":          [dict(r) for r in recent],
+        "recent":          recent_enriched,
         "model_rows":      [dict(r) for r in model_rows],
         "hourly_map":      hourly_map,
     }
@@ -304,7 +351,11 @@ def _recent_html(d: dict) -> str:
         ratio = f"{round(inp/(inp+out)*100)}% in" if (inp + out) > 0 else "—"
         model = _shorten_model(r["model"] or "—")
         dur = f"{r['duration_minutes']}m" if r["duration_minutes"] else "—"
-        ach = r["achievement"] or ""
+        import html as _html_mod
+        summary_raw = r.get("summary") or ""
+        summary_short = summary_raw[:100] + "…" if len(summary_raw) > 100 else summary_raw
+        summary_title = _html_mod.escape(summary_raw, quote=True)
+        summary_cell  = _html_mod.escape(summary_short)
         cwd_full = r["cwd"] or ""
         cwd_short = _abbrev_cwd(cwd_full)
         html += f"""
@@ -317,7 +368,7 @@ def _recent_html(d: dict) -> str:
           <td class="td-right td-dim">{ratio}</td>
           <td class="td-right td-dim">{dur}</td>
           <td class="td-dim">{model}</td>
-          <td class="td-dim" style="font-size:11px;max-width:180px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap">{ach}</td>
+          <td class="td-summary td-dim" title="{summary_title}">{summary_cell}</td>
         </tr>"""
     return html or '<tr><td colspan="9" style="color:#6B7280;text-align:center;padding:20px">No sessions</td></tr>'
 
@@ -494,6 +545,7 @@ def _html(views: dict, from_date: str = "", to_date: str = "") -> str:
   .td-dim {{ color:var(--muted); }}
   .td-project {{ font-weight:500; max-width:160px; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }}
   .td-cwd {{ font-size:11px; max-width:180px; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; cursor:default; }}
+  .td-summary {{ font-size:11px; max-width:260px; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; cursor:default; }}
   .td-bar {{ display:flex; align-items:center; gap:6px; min-width:100px; }}
   .bar-bg {{ flex:1; height:4px; background:var(--border); border-radius:2px; overflow:hidden; }}
   .bar-fill {{ height:100%; background:var(--blue); border-radius:2px; }}
@@ -593,7 +645,7 @@ def _html(views: dict, from_date: str = "", to_date: str = "") -> str:
         <thead><tr>
           <th>Date</th><th>Time</th><th>Project</th><th>Working Dir</th>
           <th class="td-right">Tokens</th><th class="td-right">Ratio</th>
-          <th class="td-right">Dur</th><th>Model</th><th>Note</th>
+          <th class="td-right">Dur</th><th>Model</th><th>Summary</th>
         </tr></thead>
         {recent_html_all}
       </table>
